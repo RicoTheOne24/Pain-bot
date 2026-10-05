@@ -15,7 +15,8 @@ RUN curl -L \
 COPY package*.json ./
 
 RUN npm install
+RUN npm install -g tsx
 
 COPY . .
 
-CMD ["npx", "tsx", "index.tsx"]
+CMD ["tsx", "index.tsx"]
