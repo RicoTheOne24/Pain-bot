@@ -1,14 +1,21 @@
-FROM node:20-alpine
+FROM node:22-bookworm
 
-WORKDIR /usr/src/app
+WORKDIR /app
 
-ENV NODE_ENV=production
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -L \
+      https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+      -o /usr/local/bin/yt-dlp \
+    && chmod a+rx /usr/local/bin/yt-dlp \
+    && yt-dlp --version
 
 COPY package*.json ./
-RUN npm ci --omit=dev
+
+RUN npm install
 
 COPY . .
 
-EXPOSE 3000
-
-CMD ["npm", "start"]
+CMD ["npx", "tsx", "index.tsx"]
