@@ -1,7 +1,10 @@
 import { Client, GatewayIntentBits, SlashCommandBuilder, REST, Routes, EmbedBuilder, ChannelType, ActivityType, VoiceBasedChannel } from "discord.js";
 import { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, StreamType, entersState } from "@discordjs/voice";
-import type { ChildProcessWithoutNullStreams } from "child_process";
-import { YtDlp, helpers } from "ytdlp-nodejs";
+import { execFile, spawn } from "child_process";
+import { promisify } from "util";
+
+const execFilePromise = promisify(execFile);
+const YT_DLP_PATH = process.env.YT_DLP_PATH || "/usr/local/bin/yt-dlp";
 
 const client = new Client({
   intents: [
@@ -27,9 +30,8 @@ const nowPlaying = new Map<string, string>();
 const voiceConnections = new Map<string, any>();
 const audioPlayers = new Map<string, ReturnType<typeof createAudioPlayer>>();
 const currentResources = new Map<string, any>();
-const ytDlpProcesses = new Map<string, ChildProcessWithoutNullStreams>();
+const ytDlpProcesses = new Map<string, ReturnType<typeof spawn>>();
 const musicVolumes = new Map<string, number>();
-let ytdlp: YtDlp | null = null;
 
 // Your Discord username for admin check
 const ADMIN_USERNAME = "im.miserable";
@@ -165,30 +167,44 @@ type SearchResult = {
 
 const resolveSong = async (query: string): Promise<SearchResult | null> => {
   try {
-    if (!ytdlp) throw new Error("Music engine is not initialized yet.");
     const target = /^https?:\/\//i.test(query) ? query : `ytsearch1:${query}`;
 
-    const output = await ytdlp.execAsync(target, {
-      noWarnings: true,
-      skipDownload: true,
-      noPlaylist: true,
-      jsRuntime: "node",
-      print: "%(title)s\t%(webpage_url)s",
-    });
+    const { stdout } = await execFilePromise(
+      YT_DLP_PATH,
+      [
+        "--no-warnings",
+        "--skip-download",
+        "--no-playlist",
+        "--js-runtimes",
+        "node",
+        "--remote-components",
+        "ejs:github",
+        "--print",
+        "%(title)s\t%(webpage_url)s",
+        target,
+      ],
+      {
+        timeout: 45_000,
+        maxBuffer: 5 * 1024 * 1024,
+      }
+    );
 
-    const line = output
+    const line = stdout
       .trim()
       .split(/\r?\n/)
-      .find((value: string) => value.includes("\t"));
+      .find((value) => value.includes("\t"));
 
-    if (!line) return null;
+    if (!line) {
+      console.error(`yt-dlp returned no search result for: ${query}`);
+      return null;
+    }
 
     const [title, url] = line.split("\t");
     if (!title || !url) return null;
 
     return { title, url };
   } catch (error) {
-    console.error("Error resolving song:", error);
+    console.error("Error resolving song with yt-dlp:", error);
     return null;
   }
 };
@@ -322,42 +338,51 @@ const playNextSong = async (guildId: string) => {
   nowPlaying.set(guildId, track.title);
 
   try {
-    if (!ytdlp) throw new Error("Music engine is not initialized yet.");
+    const ytDlpProcess = spawn(
+      YT_DLP_PATH,
+      [
+        "--no-warnings",
+        "--no-playlist",
+        "--js-runtimes",
+        "node",
+        "--remote-components",
+        "ejs:github",
+        "-f",
+        "bestaudio[ext=webm][acodec=opus]/bestaudio[acodec=opus]",
+        "-o",
+        "-",
+        track.url,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    );
 
-    // ytdlp-nodejs manages the yt-dlp binary for us.
-    // Direct WebM/Opus output lets Discord Voice consume the stream directly.
-    const process = ytdlp.exec(track.url, {
-      noWarnings: true,
-      noPlaylist: true,
-      format: "bestaudio[ext=webm][acodec=opus]/bestaudio[acodec=opus]",
-      output: "-",
-    });
-
-    ytDlpProcesses.set(guildId, process);
+    ytDlpProcesses.set(guildId, ytDlpProcess);
 
     let stderrText = "";
 
-    process.stderr.on("data", (chunk: Buffer) => {
+    ytDlpProcess.stderr.on("data", (chunk) => {
       const message = chunk.toString().trim();
-
       if (message) {
         stderrText += `${message}\n`;
         console.log(`[yt-dlp:${guildId}] ${message}`);
       }
     });
 
-    process.on("error", (error) => {
+    ytDlpProcess.on("error", (error) => {
       console.error(`yt-dlp process error for ${guildId}:`, error);
+      if (ytDlpProcesses.get(guildId) === ytDlpProcess) {
+        ytDlpProcesses.delete(guildId);
+      }
     });
 
-    process.on("close", (code) => {
+    ytDlpProcess.on("close", (code) => {
       if (code !== 0 && stderrText) {
         console.error(
           `[yt-dlp:${guildId}] exited with code ${code}: ${stderrText.trim()}`
         );
       }
 
-      if (ytDlpProcesses.get(guildId) === process) {
+      if (ytDlpProcesses.get(guildId) === ytDlpProcess) {
         ytDlpProcesses.delete(guildId);
       }
     });
@@ -386,13 +411,13 @@ client.once("clientReady", async () => {
   console.log(`✓ Bot logged in as ${client.user?.tag}`);
 
   try {
-    console.log("⏬ Preparing yt-dlp binary for music...");
-    const binaryPath = await helpers.downloadYtDlp();
-    ytdlp = new YtDlp({ binaryPath });
-    console.log(`✓ yt-dlp ready at ${binaryPath}`);
+    const { stdout } = await execFilePromise(YT_DLP_PATH, ["--version"], {
+      timeout: 10_000,
+    });
+    console.log(`✓ yt-dlp ready at ${YT_DLP_PATH} (${stdout.trim()})`);
   } catch (error) {
-    console.error("❌ Failed to prepare yt-dlp:", error);
-    console.error("Music commands will be unavailable until yt-dlp is available.");
+    console.error(`❌ yt-dlp is not available at ${YT_DLP_PATH}:`, error);
+    console.error("Music commands require the Railway Dockerfile to install yt-dlp.");
   }
 
   try {
@@ -778,9 +803,7 @@ client.on("interactionCreate", async (interaction) => {
           }
 
           await interaction.editReply(
-            ytdlp
-              ? "❌ I couldn't start the music system."
-              : "❌ The music engine is not ready yet. Check the Railway logs for the yt-dlp setup error."
+            "❌ I couldn't start playback. Check the Railway logs for the yt-dlp error."
           ).catch(() => {});
         }
 
