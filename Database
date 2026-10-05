@@ -1,1 +1,1 @@
-
+DATABASE_URL=${{Postgres.DATABASE_URL}}
